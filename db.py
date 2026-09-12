@@ -27,7 +27,29 @@ CREATE TABLE IF NOT EXISTS tasks (
     done_at       TEXT,
     created_at    TEXT    NOT NULL
 );
+
+-- Shop options offered to a user, awaiting their tap. In SQLite rather than
+-- memory so a restart mid-choice doesn't lose them.
+CREATE TABLE IF NOT EXISTS candidates (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    title         TEXT    NOT NULL,
+    place_name    TEXT    NOT NULL,
+    place_address TEXT,
+    lat           REAL    NOT NULL,
+    lng           REAL    NOT NULL,
+    distance_m    INTEGER NOT NULL,
+    created_at    TEXT    NOT NULL
+);
 """
+
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS won't add
+# them to a database that already exists, so they go on separately.
+MIGRATIONS = [
+    ("users", "last_lat", "REAL"),
+    ("users", "last_lng", "REAL"),
+    ("users", "last_seen_at", "TEXT"),
+]
 
 
 def now_iso() -> str:
@@ -54,6 +76,10 @@ def cursor():
 def init_db() -> None:
     with cursor() as conn:
         conn.executescript(SCHEMA)
+        for table, column, coltype in MIGRATIONS:
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 def get_user(chat_id: int) -> dict | None:
@@ -146,3 +172,49 @@ def mark_done(task_id: int) -> None:
             "UPDATE tasks SET done_at = ? WHERE id = ? AND done_at IS NULL",
             (now_iso(), task_id),
         )
+
+
+def set_last_location(chat_id: int, lat: float, lng: float) -> None:
+    """Remember where the user was, so task creation can search around them."""
+    with cursor() as conn:
+        conn.execute(
+            "UPDATE users SET last_lat = ?, last_lng = ?, last_seen_at = ? WHERE chat_id = ?",
+            (lat, lng, now_iso(), chat_id),
+        )
+
+
+def save_candidates(chat_id: int, title: str, places: list[dict]) -> list[dict]:
+    """Replace this user's pending shop options with a new set."""
+    with cursor() as conn:
+        conn.execute("DELETE FROM candidates WHERE chat_id = ?", (chat_id,))
+        for place in places:
+            conn.execute(
+                """INSERT INTO candidates
+                   (chat_id, title, place_name, place_address, lat, lng, distance_m, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, title, place["name"], place.get("address"), place["lat"],
+                 place["lng"], round(place["distance_m"]), now_iso()),
+            )
+    return list_candidates(chat_id)
+
+
+def list_candidates(chat_id: int) -> list[dict]:
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT * FROM candidates WHERE chat_id = ? ORDER BY distance_m",
+            (chat_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_candidate(candidate_id: int) -> dict | None:
+    with cursor() as conn:
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def clear_candidates(chat_id: int) -> None:
+    with cursor() as conn:
+        conn.execute("DELETE FROM candidates WHERE chat_id = ?", (chat_id,))

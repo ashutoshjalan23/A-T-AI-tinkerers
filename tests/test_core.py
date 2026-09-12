@@ -301,3 +301,144 @@ def test_users_do_not_see_each_others_tasks(fresh_db, offline):
     core.ensure_user(other)
     assert core.open_tasks(other) == []
     assert core.on_location(other, *NEAR) == []
+
+
+# --- near-you category errands ------------------------------------------------
+
+CYBERPORT = (22.26060, 114.13010)
+
+
+def category_parse(text):
+    return {"title": "Buy groceries", "place_query": "supermarket", "kind": "category"}
+
+
+def fake_nearby(query, lat, lng, radius_m=2000, limit=3):
+    return [
+        {"name": "PARKnSHOP", "address": "Cyberport Arcade", "lat": 22.2610,
+         "lng": 114.1310, "distance_m": 117.4},
+        {"name": "Wellcome", "address": "Pokfulam", "lat": 22.2650,
+         "lng": 114.1350, "distance_m": 640.2},
+    ]
+
+
+def test_category_without_a_known_location_asks_for_one(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    result = core.create_task(CHAT, "i need to buy groceries")
+    assert isinstance(result, core.Err)
+    assert "where you are" in result.message
+    assert core.open_tasks(CHAT) == []
+
+
+def test_category_offers_nearby_choices(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", fake_nearby)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+
+    result = core.create_task(CHAT, "i need to buy groceries")
+    assert isinstance(result, core.Choices)
+    assert result.title == "Buy groceries"
+    assert [o["place_name"] for o in result.options] == ["PARKnSHOP", "Wellcome"]
+    assert result.options[0]["distance_m"] == 117
+    assert core.open_tasks(CHAT) == []  # nothing saved until they pick
+
+
+def test_category_searches_around_the_user_not_the_territory(fresh_db, offline, monkeypatch):
+    """The Lantau bug: the search must be anchored to the user's position."""
+    seen = {}
+
+    def spy(query, lat, lng, radius_m=2000, limit=3):
+        seen.update(query=query, lat=lat, lng=lng)
+        return fake_nearby(query, lat, lng)
+
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", spy)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    core.create_task(CHAT, "buy groceries")
+
+    assert (seen["lat"], seen["lng"]) == CYBERPORT
+    assert seen["query"] == "supermarket"
+
+
+def test_picking_a_candidate_creates_the_task(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", fake_nearby)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    choices = core.create_task(CHAT, "buy groceries")
+
+    task = core.choose_candidate(CHAT, choices.options[0]["id"])
+    assert not isinstance(task, core.Err)
+    assert task["place_name"] == "PARKnSHOP"
+    assert task["hours"] == "19:00"
+    assert len(core.open_tasks(CHAT)) == 1
+    assert db.list_candidates(CHAT) == []  # options cleared after the pick
+
+
+def test_picking_twice_is_harmless(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", fake_nearby)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    choices = core.create_task(CHAT, "buy groceries")
+    cid = choices.options[0]["id"]
+
+    core.choose_candidate(CHAT, cid)
+    second = core.choose_candidate(CHAT, cid)
+    assert isinstance(second, core.Err)
+    assert len(core.open_tasks(CHAT)) == 1
+
+
+def test_cannot_pick_another_users_candidate(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", fake_nearby)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    choices = core.create_task(CHAT, "buy groceries")
+
+    other = 888777
+    core.ensure_user(other)
+    assert isinstance(core.choose_candidate(other, choices.options[0]["id"]), core.Err)
+
+
+def test_no_shops_nearby_is_a_friendly_error(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", lambda *a, **k: [])
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    result = core.create_task(CHAT, "buy groceries")
+    assert isinstance(result, core.Err)
+    assert "2km" in result.message
+
+
+def test_location_update_records_position(fresh_db, offline):
+    core.ensure_user(CHAT)
+    core.on_location(CHAT, *CYBERPORT)
+    user = db.get_user(CHAT)
+    assert (user["last_lat"], user["last_lng"]) == CYBERPORT
+    assert user["last_seen_at"] is not None
+
+
+def test_named_shop_still_resolves_directly(fresh_db, offline):
+    """A named place must not go through the choice flow."""
+    result = core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    assert not isinstance(result, (core.Err, core.Choices))
+    assert result["place_name"] == "Central Cleaners"
+
+
+def test_candidates_survive_a_restart(fresh_db, offline, monkeypatch):
+    import importlib
+
+    monkeypatch.setattr(offline, "parse_task", category_parse)
+    monkeypatch.setattr(offline, "nearby_places", fake_nearby)
+    core.ensure_user(CHAT)
+    db.set_last_location(CHAT, *CYBERPORT)
+    choices = core.create_task(CHAT, "buy groceries")
+    cid = choices.options[0]["id"]
+
+    importlib.reload(db)
+    reloaded = importlib.reload(core)
+    task = reloaded.choose_candidate(CHAT, cid)
+    assert not isinstance(task, core.Err)
+    assert task["place_name"] == "PARKnSHOP"

@@ -106,6 +106,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(result.message)
         return
 
+    if isinstance(result, core.Choices):
+        await message.reply_text(
+            f"{result.title} — which one?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"{o['place_name']} · {_pretty_distance(o['distance_m'])}",
+                    callback_data=f"pick:{o['id']}",
+                )]
+                for o in result.options
+            ]),
+        )
+        return
+
+    await _confirm_task(message, result)
+
+
+def _pretty_distance(metres: int) -> str:
+    return f"{metres}m" if metres < 1000 else f"{metres / 1000:.1f}km"
+
+
+async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    result = core.choose_candidate(query.message.chat_id, int(query.data.split(":", 1)[1]))
+    if isinstance(result, core.Err):
+        await query.edit_message_text(result.message)
+        return
+    await query.edit_message_text(f"{result['title']} at {result['place_name']}.")
+    await _confirm_task(query.message, result)
+
+
+async def _confirm_task(message, result: dict) -> None:
     card = [f"Got it: {result['title']}", f"At {result['place_name']}"]
     if result["place_address"]:
         card.append(result["place_address"])
@@ -215,6 +247,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sim", sim))
     app.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(on_done, pattern=r"^done:"))
+    app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
 
     loc_filter = filters.LOCATION & (
         filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE

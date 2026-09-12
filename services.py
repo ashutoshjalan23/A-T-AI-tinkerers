@@ -14,12 +14,14 @@ from config import (
     EXA_API_KEY,
     LOCAL_TZ,
     NO_CALENDAR_MINUTES,
+    NEARBY_RADIUS_M,
     NOMINATIM_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
     USER_AGENT,
 )
+from geo import haversine
 
 log = logging.getLogger("detour.services")
 TZ = ZoneInfo(LOCAL_TZ)
@@ -30,14 +32,39 @@ Return JSON only. No prose, no markdown fences, no explanation.
 
 Schema:
 {"title": "<short imperative errand, max 6 words>",
- "place_query": "<searchable place name, add 'Hong Kong' if no city is given>"}
+ "kind": "place" | "category",
+ "place_query": "<see below>"}
+
+Use "place" when the user names a specific shop. place_query is that shop plus
+the city.
+
+Use "category" when the user names only a product or an errand type, with no
+shop. place_query must then be a single OpenStreetMap tag word for the kind of
+shop that sells it - supermarket, pharmacy, chemist, bakery, laundry,
+convenience, hardware, books, greengrocer. No city, no product name, no
+adjectives. Prefer "supermarket" over "grocery"; OSM has almost nothing tagged
+"grocery".
 
 Examples:
 "remind me to pick up my jacket at Central Cleaners when I am nearby"
--> {"title": "Pick up jacket", "place_query": "Central Cleaners Hong Kong"}
+-> {"title": "Pick up jacket", "kind": "place", "place_query": "Central Cleaners Hong Kong"}
 "grab detergent from the Watsons in Central"
--> {"title": "Buy detergent", "place_query": "Watsons Central Hong Kong"}
+-> {"title": "Buy detergent", "kind": "place", "place_query": "Watsons Central Hong Kong"}
+"i need to buy groceries today"
+-> {"title": "Buy groceries", "kind": "category", "place_query": "supermarket"}
+"pick up my prescription"
+-> {"title": "Pick up prescription", "kind": "category", "place_query": "pharmacy"}
 """
+
+# OSM tags almost nobody uses, mapped to the one that actually has data.
+CATEGORY_FIXES = {
+    "grocery": "supermarket",
+    "grocery store": "supermarket",
+    "groceries": "supermarket",
+    "drugstore": "pharmacy",
+    "dry cleaner": "laundry",
+    "dry cleaning": "laundry",
+}
 
 RETAILER_SYSTEM_PROMPT = """You read search results and list shops that sell a product.
 
@@ -80,7 +107,10 @@ def parse_task(text: str) -> dict | None:
         place_query = str(data.get("place_query", "")).strip()
         if not title or not place_query:
             return None
-        return {"title": title, "place_query": place_query}
+        kind = "category" if str(data.get("kind", "")).lower() == "category" else "place"
+        if kind == "category":
+            place_query = CATEGORY_FIXES.get(place_query.lower(), place_query)
+        return {"title": title, "place_query": place_query, "kind": kind}
     except Exception as e:
         log.warning("parse_task failed: %s", e)
         return None
@@ -123,6 +153,66 @@ def resolve_place(query: str) -> dict | None:
     except Exception as e:
         log.warning("resolve_place failed for %r: %s", query, e)
         return None
+
+
+def nearby_places(query: str, lat: float, lng: float, radius_m: int = NEARBY_RADIUS_M,
+                  limit: int = 3) -> list[dict]:
+    """Shops matching `query` within `radius_m` of a point, nearest first.
+
+    Bounded to a box around the user. Unbounded, Nominatim happily returns a
+    match on the far side of the territory, which is how a grocery run ends up
+    pinned to Lantau.
+    """
+    deg = radius_m / 111_000  # rough metres-per-degree; fine at this scale
+    viewbox = f"{lng - deg},{lat + deg},{lng + deg},{lat - deg}"
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={
+                "q": query,
+                "format": "jsonv2",
+                "limit": 10,
+                "viewbox": viewbox,
+                "bounded": 1,  # the whole point: hard-restrict to the box
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        hits = resp.json()
+    except Exception as e:
+        log.warning("nearby_places failed for %r: %s", query, e)
+        return []
+
+    places = []
+    for hit in hits:
+        try:
+            hit_lat, hit_lng = float(hit["lat"]), float(hit["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        distance = haversine(lat, lng, hit_lat, hit_lng)
+        if distance > radius_m:
+            continue
+        display = hit.get("display_name", query)
+        places.append({
+            "name": hit.get("name") or _unnamed_label(hit, display, query),
+            "address": display,
+            "lat": hit_lat,
+            "lng": hit_lng,
+            "distance_m": distance,
+        })
+    places.sort(key=lambda p: p["distance_m"])
+    log.info("nearby_places(%r) within %dm: %d hits", query, radius_m, len(places))
+    return places[:limit]
+
+
+def _unnamed_label(hit: dict, display: str, query: str) -> str:
+    """OSM has real shops with no name tag. "18-20" is a useless button, so
+    label them by what they are and the street they're on."""
+    kind = (hit.get("type") or query).replace("_", " ").title()
+    parts = [p.strip() for p in display.split(",") if p.strip()]
+    street = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
+    return f"{kind} on {street}" if street else kind
 
 
 def _demo_place(query: str) -> dict | None:
@@ -219,10 +309,7 @@ def _retailer_names(product: str, city: str) -> list[str]:
             messages=[
                 {"role": "system", "content": RETAILER_SYSTEM_PROMPT},
                 {"role": "user",
-                 "content": f"Product: {product}
-City: {city}
-
-{text[:6000]}"},
+                 "content": f"Product: {product}\nCity: {city}\n\n{text[:6000]}"},
             ],
         )
         data = json.loads(resp.choices[0].message.content)
@@ -240,9 +327,7 @@ def _search_text(query: str) -> str:
         results = Exa(EXA_API_KEY).search_and_contents(
             query, num_results=3, text={"max_characters": 2500}
         )
-        return "
-
-".join(
+        return "\n\n".join(
             getattr(r, "text", "") or "" for r in getattr(results, "results", [])
         )
     except Exception as e:

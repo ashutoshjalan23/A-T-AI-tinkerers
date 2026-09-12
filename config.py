@@ -22,6 +22,9 @@ USER_AGENT = "Detour/1.0 (hackathon errand bot)"
 AMBIGUOUS_BASE_URL = os.getenv("AMBIGUOUS_BASE_URL", "https://api.ambiguous.com")
 
 LOCAL_TZ = "Asia/Hong_Kong"
+
+# How far around the user to look for a shop when they name a category, not a shop.
+NEARBY_RADIUS_M = 2000
 NO_CALENDAR_MINUTES = 1440
 
 TRAVEL_MODES = ("walk", "mtr", "taxi")

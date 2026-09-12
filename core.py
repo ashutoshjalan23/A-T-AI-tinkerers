@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import db
 import services
-from config import TRAVEL_MODES
+from config import NEARBY_RADIUS_M, TRAVEL_MODES
 from geo import ERRAND_MINUTES, MAX_DISTANCE_M, eta_minutes, haversine
 
 log = logging.getLogger("detour.core")
@@ -17,6 +17,14 @@ class Err:
     """A user-safe failure. Never carries a traceback or an API detail."""
 
     message: str
+
+
+@dataclass
+class Choices:
+    """Several shops matched. The user picks; we never pick for them."""
+
+    title: str
+    options: list[dict]
 
 
 def should_fire(task: dict, distance_m: float, mode: str, free_min: int) -> tuple[bool, dict]:
@@ -63,24 +71,74 @@ def set_calendar(chat_id: int, value: str) -> str | None:
     return title
 
 
-def create_task(chat_id: int, text: str) -> dict | Err:
-    """parse_task -> resolve_place -> enrich_hours -> insert."""
-    ensure_user(chat_id)
+def create_task(chat_id: int, text: str) -> dict | Choices | Err:
+    """parse_task -> find the place -> enrich_hours -> insert.
+
+    A named shop resolves straight to a pin. A category ("groceries") searches
+    around the user's last known position and comes back as Choices.
+    """
+    user = ensure_user(chat_id)
 
     parsed = services.parse_task(text)
     if not parsed:
         return Err("I couldn't work out an errand from that. Try: "
                    "\"pick up my jacket at Central Cleaners\".")
 
+    if parsed.get("kind") == "category":
+        return _category_choices(user, parsed)
+
     place = services.resolve_place(parsed["place_query"])
     if not place:
         return Err(f"I couldn't find \"{parsed['place_query']}\". "
                    "Try naming the place more precisely.")
 
+    return _insert(chat_id, parsed["title"], place)
+
+
+def _category_choices(user: dict, parsed: dict) -> Choices | Err:
+    """Offer nearby shops of the right kind, nearest first."""
+    if user["last_lat"] is None or user["last_lng"] is None:
+        return Err(
+            f"I can find a {parsed['place_query']} near you, but I don't know "
+            "where you are yet. Share your location and send that again."
+        )
+
+    found = services.nearby_places(
+        parsed["place_query"], user["last_lat"], user["last_lng"]
+    )
+    if not found:
+        return Err(
+            f"I couldn't find a {parsed['place_query']} within "
+            f"{NEARBY_RADIUS_M // 1000}km of you. Try naming the shop directly."
+        )
+
+    options = db.save_candidates(user["chat_id"], parsed["title"], found)
+    log.info("offering %d candidates to chat %s for %r",
+             len(options), user["chat_id"], parsed["title"])
+    return Choices(title=parsed["title"], options=options)
+
+
+def choose_candidate(chat_id: int, candidate_id: int) -> dict | Err:
+    """Turn a tapped option into a real task."""
+    candidate = db.get_candidate(candidate_id)
+    if not candidate or candidate["chat_id"] != chat_id:
+        return Err("That option has expired. Send the errand again.")
+    place = {
+        "name": candidate["place_name"],
+        "address": candidate["place_address"],
+        "lat": candidate["lat"],
+        "lng": candidate["lng"],
+    }
+    task = _insert(chat_id, candidate["title"], place)
+    db.clear_candidates(chat_id)
+    return task
+
+
+def _insert(chat_id: int, title: str, place: dict) -> dict:
     hours = services.enrich_hours(place["name"], place.get("address"))
     task = db.insert_task(
         chat_id=chat_id,
-        title=parsed["title"],
+        title=title,
         place_name=place["name"],
         place_address=place.get("address"),
         lat=place["lat"],
@@ -95,6 +153,7 @@ def create_task(chat_id: int, text: str) -> dict | Err:
 def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
     """Check every open task against this position. Stamps fired_at as it goes."""
     user = ensure_user(chat_id)
+    db.set_last_location(chat_id, lat, lng)  # so a later errand can search around here
     mode = user["travel_mode"]
     candidates = db.unfired_tasks(chat_id)
     if not candidates:
