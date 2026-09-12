@@ -7,6 +7,24 @@ calendar event, scaled by how you travel.
 The LLM parses language. Distance, timing, and the decision to fire are
 deterministic Python.
 
+## Agent flow
+
+Free-text messages go to a bounded OpenRouter orchestration agent using
+`openai/gpt-4o-mini`. It can keep a normal conversation and call three focused
+workers:
+
+- **Scheduler agent** — an LLM that explains suitable time using verified
+  calendar facts.
+- **Map agent** — deterministic Nominatim lookup, nearby-place search, and
+  distance calculations.
+- **Live-location agent** — deterministic persistence of each Telegram live
+  location update.
+
+The scheduler and orchestrator are limited to the Agent SDK's tool loop. The
+map and live-location workers never call a model. Crucially, neither LLM can
+fire a reminder: the existing deterministic distance-and-round-trip rule in
+`core.on_location` remains the only notification gate.
+
 ## Setup
 
 ```bash
@@ -97,6 +115,7 @@ the product.
 | `db.py` | SQLite schema and queries |
 | `geo.py` | haversine, `eta_minutes` |
 | `services.py` | OpenRouter parse, Nominatim geocode, Exa hours, calendar |
+| `agents.py` | OpenRouter orchestrator and scheduler; deterministic map and location workers |
 | `core.py` | orchestration — **no telegram imports**, callable headless |
 | `bot.py` | Telegram handlers only |
 | `sim.py` | offline harness |

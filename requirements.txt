@@ -1,5 +1,6 @@
 python-telegram-bot==21.*
 openai
+openrouter-agent-sdk
 exa-py
 icalendar
 requests

@@ -100,26 +100,21 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
-    result = core.handle_message(message.chat_id, message.text)
+    reply = await core.handle_conversation(message.chat_id, message.text)
+    result = reply.result
 
     if isinstance(result, core.Err):
-        core.remember_reply(message.chat_id, result.message)
-        await message.reply_text(result.message)
+        await message.reply_text(reply.text or result.message)
         return
 
     if isinstance(result, core.Completed):
-        reply = f"Closed: {result.task['title']} at {result.task['place_name']}."
-        core.remember_reply(message.chat_id, reply)
-        await message.reply_text(reply)
+        await message.reply_text(reply.text or
+                                 f"Closed: {result.task['title']} at {result.task['place_name']}.")
         return
 
     if isinstance(result, core.Choices):
-        core.remember_reply(
-            message.chat_id,
-            f"offered: {', '.join(o['place_name'] for o in result.options)}",
-        )
         await message.reply_text(
-            f"{result.title} — which one?",
+            reply.text or f"{result.title} — which one?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
                     f"{o['place_name']} · {_pretty_distance(o['distance_m'])}",
@@ -130,7 +125,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await _confirm_task(message, result)
+    if isinstance(result, dict):
+        if reply.text:
+            await message.reply_text(reply.text)
+        await _confirm_task(message, result)
+        return
+
+    await message.reply_text(reply.text)
 
 
 def _pretty_distance(metres: int) -> str:

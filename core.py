@@ -122,6 +122,23 @@ def handle_message(chat_id: int, text: str) -> dict | Choices | Completed | Err:
     return _create_from_parsed(user, parsed)
 
 
+async def handle_conversation(chat_id: int, text: str):
+    """Use the LLM orchestration agent for free-form Telegram conversation.
+
+    The agent can call the scheduler, map, and live-location workers, but the
+    fire rule remains entirely in :func:`on_location` below.
+    """
+    from agents import OrchestrationAgent
+
+    user = ensure_user(chat_id)
+    db.add_message(chat_id, "user", text)
+    agent = OrchestrationAgent(_create_from_parsed, _complete_by_reference, build_context)
+    reply = await agent.respond(user, text)
+    if reply.text:
+        db.add_message(chat_id, "bot", reply.text)
+    return reply
+
+
 def remember_reply(chat_id: int, text: str) -> None:
     """Record what we said, so the next turn can resolve "the other one"."""
     db.add_message(chat_id, "bot", text)
@@ -156,10 +173,13 @@ def create_task(chat_id: int, text: str) -> dict | Choices | Err:
 
 
 def _create_from_parsed(user: dict, parsed: dict) -> dict | Choices | Err:
-    if parsed.get("kind") == "category":
-        return _category_choices(user, parsed)
+    from agents import MapAgent
 
-    place = services.resolve_place(parsed["place_query"])
+    maps = MapAgent()
+    if parsed.get("kind") == "category":
+        return _category_choices(user, parsed, maps)
+
+    place = maps.resolve(parsed["place_query"])
     if not place:
         return Err(f"I couldn't find \"{parsed['place_query']}\". "
                    "Try naming the place more precisely.")
@@ -167,7 +187,7 @@ def _create_from_parsed(user: dict, parsed: dict) -> dict | Choices | Err:
     return _insert(user["chat_id"], parsed["title"], place)
 
 
-def _category_choices(user: dict, parsed: dict) -> Choices | Err:
+def _category_choices(user: dict, parsed: dict, maps=None) -> Choices | Err:
     """Offer nearby shops of the right kind, nearest first."""
     if user["last_lat"] is None or user["last_lng"] is None:
         return Err(
@@ -175,9 +195,11 @@ def _category_choices(user: dict, parsed: dict) -> Choices | Err:
             "where you are yet. Share your location and send that again."
         )
 
-    found = services.nearby_places(
-        parsed["place_query"], user["last_lat"], user["last_lng"]
-    )
+    if maps is None:
+        from agents import MapAgent
+
+        maps = MapAgent()
+    found = maps.nearby(parsed["place_query"], user["last_lat"], user["last_lng"])
     if not found:
         return Err(
             f"I couldn't find a {parsed['place_query']} within "
@@ -225,7 +247,10 @@ def _insert(chat_id: int, title: str, place: dict) -> dict:
 def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
     """Check every open task against this position. Stamps fired_at as it goes."""
     user = ensure_user(chat_id)
-    db.set_last_location(chat_id, lat, lng)  # so a later errand can search around here
+    # The deterministic live-location agent persists every Telegram update.
+    from agents import LiveLocationAgent, MapAgent
+
+    LiveLocationAgent().record(chat_id, lat, lng)
     refresh_area(chat_id, lat, lng)
     mode = user["travel_mode"]
     candidates = db.unfired_tasks(chat_id)
@@ -237,7 +262,7 @@ def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
 
     fires = []
     for task in candidates:
-        distance = haversine(lat, lng, task["lat"], task["lng"])
+        distance = MapAgent().distance_to(lat, lng, task)
         fire, metrics = should_fire(task, distance, mode, free_min)
         log.info(
             "task %s %s: %dm, mode=%s, free=%dmin -> %s",
