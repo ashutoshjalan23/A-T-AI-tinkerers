@@ -165,3 +165,58 @@ def test_a_broken_calendar_never_raises(monkeypatch):
 def test_parse_task_without_a_key_returns_none(monkeypatch):
     monkeypatch.setattr(services, "OPENROUTER_API_KEY", "")
     assert services.parse_task("pick up my jacket") is None
+
+
+# --- non-errand guard --------------------------------------------------------
+
+@pytest.mark.parametrize("value", [None, "null", "None", "n/a", "", "  ", "NULL"])
+def test_clean_treats_model_nulls_as_empty(value):
+    """Models return the string "null" as often as real null."""
+    assert services._clean(value) == ""
+
+
+@pytest.mark.parametrize("value,expected", [("Watsons", "Watsons"), ("  Buy milk  ", "Buy milk")])
+def test_clean_keeps_real_values(value, expected):
+    assert services._clean(value) == expected
+
+
+class FakeCompletion:
+    def __init__(self, payload):
+        self.choices = [type("C", (), {"message": type("M", (), {"content": payload})()})()]
+
+
+def stub_openai(monkeypatch, payload):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": self})()
+
+        def create(self, **kwargs):
+            return FakeCompletion(payload)
+
+    import openai
+
+    monkeypatch.setattr(services, "OPENROUTER_API_KEY", "key")
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+
+
+def test_parse_task_rejects_a_null_errand(monkeypatch):
+    """"remind me" must not become a task pinned to the middle of the city."""
+    stub_openai(monkeypatch, '{"title": null, "kind": null, "place_query": null}')
+    assert services.parse_task("remind me") is None
+
+
+def test_parse_task_rejects_the_literal_string_null(monkeypatch):
+    stub_openai(monkeypatch, '{"title": "null", "kind": "category", "place_query": "null"}')
+    assert services.parse_task("check location") is None
+
+
+def test_parse_task_maps_unusable_osm_categories(monkeypatch):
+    stub_openai(monkeypatch, '{"title": "Buy food", "kind": "category", "place_query": "grocery"}')
+    parsed = services.parse_task("buy groceries")
+    assert parsed["place_query"] == "supermarket"  # OSM has nothing under "grocery"
+    assert parsed["kind"] == "category"
+
+
+def test_parse_task_defaults_to_place_when_kind_is_missing(monkeypatch):
+    stub_openai(monkeypatch, '{"title": "Pick up jacket", "place_query": "Central Cleaners"}')
+    assert services.parse_task("pick up jacket")["kind"] == "place"

@@ -45,9 +45,18 @@ convenience, hardware, books, greengrocer. No city, no product name, no
 adjectives. Prefer "supermarket" over "grocery"; OSM has almost nothing tagged
 "grocery".
 
+If the message is not an errand - a greeting, a question, a bare command like
+"remind me" or "check location", or anything with no thing to collect or buy -
+return {"title": null, "kind": null, "place_query": null}. Never invent a shop
+or a category to fill the gap.
+
 Examples:
 "remind me to pick up my jacket at Central Cleaners when I am nearby"
 -> {"title": "Pick up jacket", "kind": "place", "place_query": "Central Cleaners Hong Kong"}
+"remind me"
+-> {"title": null, "kind": null, "place_query": null}
+"hey what can you do"
+-> {"title": null, "kind": null, "place_query": null}
 "grab detergent from the Watsons in Central"
 -> {"title": "Buy detergent", "kind": "place", "place_query": "Watsons Central Hong Kong"}
 "i need to buy groceries today"
@@ -84,6 +93,14 @@ Rules:
 
 # --- OpenRouter -------------------------------------------------------------
 
+def _clean(value) -> str:
+    """Models return the string "null" as often as real null. Treat both as empty."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in ("null", "none", "n/a", "") else text
+
+
 def parse_task(text: str) -> dict | None:
     """Natural language -> {"title", "place_query"}. None on any failure."""
     if not OPENROUTER_API_KEY:
@@ -103,10 +120,10 @@ def parse_task(text: str) -> dict | None:
             ],
         )
         data = json.loads(resp.choices[0].message.content)
-        title = str(data.get("title", "")).strip()
-        place_query = str(data.get("place_query", "")).strip()
+        title = _clean(data.get("title"))
+        place_query = _clean(data.get("place_query"))
         if not title or not place_query:
-            return None
+            return None  # not an errand
         kind = "category" if str(data.get("kind", "")).lower() == "category" else "place"
         if kind == "category":
             place_query = CATEGORY_FIXES.get(place_query.lower(), place_query)
