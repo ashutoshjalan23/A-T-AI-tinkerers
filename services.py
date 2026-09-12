@@ -15,6 +15,7 @@ from config import (
     LOCAL_TZ,
     NO_CALENDAR_MINUTES,
     NEARBY_RADIUS_M,
+    NOMINATIM_REVERSE_URL,
     NOMINATIM_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
@@ -26,14 +27,34 @@ from geo import haversine
 log = logging.getLogger("detour.services")
 TZ = ZoneInfo(LOCAL_TZ)
 
-PARSE_SYSTEM_PROMPT = """You extract errands from casual messages.
+PARSE_SYSTEM_PROMPT = """You read a message to an errand bot and say what the user wants.
 
 Return JSON only. No prose, no markdown fences, no explanation.
 
 Schema:
-{"title": "<short imperative errand, max 6 words>",
+{"intent": "create" | "complete" | "none",
+ "title": "<short imperative errand, max 6 words>",
  "kind": "place" | "category",
- "place_query": "<see below>"}
+ "place_query": "<see below>",
+ "task_ref": "<for complete: the open errand they mean, copied exactly>"}
+
+Use "complete" when they say an existing errand is finished - "done with the
+groceries", "got the jacket", "picked it up". task_ref must be copied from the
+OPEN ERRANDS list you are given. If no open errand matches, use "none".
+
+Use "create" for a new errand. Then fill title, kind and place_query.
+
+Use "none" for greetings, questions, bare commands like "remind me", and
+anything with nothing to collect or buy. Set the other fields to null. Never
+invent a shop or a category to fill the gap.
+
+CONTEXT you may be given:
+- NEAR: roughly where the user is. Use it to disambiguate. If they say a chain
+  with no branch ("the Watsons"), treat it as a category, not a place.
+- OPEN ERRANDS: what they already have outstanding.
+- RECENT: the last few turns. Use them to resolve follow-ups like "the other
+  one", "make it near my office", "actually no". If a follow-up corrects a
+  previous errand, return the corrected version as a fresh "create".
 
 Use "place" when the user names a specific shop. place_query is that shop plus
 the city.
@@ -45,24 +66,23 @@ convenience, hardware, books, greengrocer. No city, no product name, no
 adjectives. Prefer "supermarket" over "grocery"; OSM has almost nothing tagged
 "grocery".
 
-If the message is not an errand - a greeting, a question, a bare command like
-"remind me" or "check location", or anything with no thing to collect or buy -
-return {"title": null, "kind": null, "place_query": null}. Never invent a shop
-or a category to fill the gap.
-
-Examples:
+Examples (intent, then the fields that matter):
 "remind me to pick up my jacket at Central Cleaners when I am nearby"
--> {"title": "Pick up jacket", "kind": "place", "place_query": "Central Cleaners Hong Kong"}
-"remind me"
--> {"title": null, "kind": null, "place_query": null}
-"hey what can you do"
--> {"title": null, "kind": null, "place_query": null}
-"grab detergent from the Watsons in Central"
--> {"title": "Buy detergent", "kind": "place", "place_query": "Watsons Central Hong Kong"}
+-> {"intent": "create", "title": "Pick up jacket", "kind": "place",
+    "place_query": "Central Cleaners Hong Kong", "task_ref": null}
 "i need to buy groceries today"
--> {"title": "Buy groceries", "kind": "category", "place_query": "supermarket"}
+-> {"intent": "create", "title": "Buy groceries", "kind": "category",
+    "place_query": "supermarket", "task_ref": null}
 "pick up my prescription"
--> {"title": "Pick up prescription", "kind": "category", "place_query": "pharmacy"}
+-> {"intent": "create", "title": "Pick up prescription", "kind": "category",
+    "place_query": "pharmacy", "task_ref": null}
+"done with the groceries"  (OPEN ERRANDS: Buy groceries, Pick up jacket)
+-> {"intent": "complete", "title": null, "kind": null, "place_query": null,
+    "task_ref": "Buy groceries"}
+"remind me"
+-> {"intent": "none", "title": null, "kind": null, "place_query": null, "task_ref": null}
+"hey what can you do"
+-> {"intent": "none", "title": null, "kind": null, "place_query": null, "task_ref": null}
 """
 
 # OSM tags almost nobody uses, mapped to the one that actually has data.
@@ -101,8 +121,22 @@ def _clean(value) -> str:
     return "" if text.lower() in ("null", "none", "n/a", "") else text
 
 
-def parse_task(text: str) -> dict | None:
-    """Natural language -> {"title", "place_query"}. None on any failure."""
+def build_context(area: str | None, open_titles: list[str],
+                  recent: list[dict]) -> str:
+    """The situational block handed to the parser. Empty string when we know nothing."""
+    blocks = []
+    if area:
+        blocks.append(f"NEAR: {area}")
+    if open_titles:
+        blocks.append("OPEN ERRANDS:\n" + "\n".join(f"- {t}" for t in open_titles))
+    if recent:
+        turns = "\n".join(f"{m['role']}: {m['text']}" for m in recent)
+        blocks.append("RECENT:\n" + turns)
+    return "\n\n".join(blocks)
+
+
+def parse_task(text: str, context: str = "") -> dict | None:
+    """Message (+ situational context) -> intent and fields. None on any failure."""
     if not OPENROUTER_API_KEY:
         log.warning("parse_task: no OPENROUTER_API_KEY")
         return None
@@ -110,24 +144,32 @@ def parse_task(text: str) -> dict | None:
         from openai import OpenAI
 
         client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY)
+        content = f"{context}\n\nMESSAGE: {text}" if context else text
         resp = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             temperature=0,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": PARSE_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
+                {"role": "user", "content": content},
             ],
         )
         data = json.loads(resp.choices[0].message.content)
+        intent = _clean(data.get("intent")).lower()
+
+        if intent == "complete":
+            task_ref = _clean(data.get("task_ref"))
+            return {"intent": "complete", "task_ref": task_ref} if task_ref else None
+
         title = _clean(data.get("title"))
         place_query = _clean(data.get("place_query"))
-        if not title or not place_query:
-            return None  # not an errand
+        if intent == "none" or not title or not place_query:
+            return None
         kind = "category" if str(data.get("kind", "")).lower() == "category" else "place"
         if kind == "category":
             place_query = CATEGORY_FIXES.get(place_query.lower(), place_query)
-        return {"title": title, "place_query": place_query, "kind": kind}
+        return {"intent": "create", "title": title,
+                "place_query": place_query, "kind": kind}
     except Exception as e:
         log.warning("parse_task failed: %s", e)
         return None
@@ -221,6 +263,29 @@ def nearby_places(query: str, lat: float, lng: float, radius_m: int = NEARBY_RAD
     places.sort(key=lambda p: p["distance_m"])
     log.info("nearby_places(%r) within %dm: %d hits", query, radius_m, len(places))
     return places[:limit]
+
+
+def reverse_place(lat: float, lng: float) -> str | None:
+    """Coordinates -> a neighbourhood name the model can reason about."""
+    try:
+        resp = requests.get(
+            NOMINATIM_REVERSE_URL,
+            params={"lat": lat, "lon": lng, "format": "jsonv2", "zoom": 14},
+            headers={"User-Agent": USER_AGENT},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        addr = resp.json().get("address", {})
+    except Exception as e:
+        log.warning("reverse_place failed: %s", e)
+        return None
+    parts = [
+        addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter"),
+        addr.get("city_district") or addr.get("district"),
+        addr.get("city") or addr.get("state"),
+    ]
+    area = ", ".join(p for p in dict.fromkeys(parts) if p)
+    return area or None
 
 
 def _unnamed_label(hit: dict, display: str, query: str) -> str:

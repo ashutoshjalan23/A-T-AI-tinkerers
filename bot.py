@@ -100,13 +100,24 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
-    result = core.create_task(message.chat_id, message.text)
+    result = core.handle_message(message.chat_id, message.text)
 
     if isinstance(result, core.Err):
+        core.remember_reply(message.chat_id, result.message)
         await message.reply_text(result.message)
         return
 
+    if isinstance(result, core.Completed):
+        reply = f"Closed: {result.task['title']} at {result.task['place_name']}."
+        core.remember_reply(message.chat_id, reply)
+        await message.reply_text(reply)
+        return
+
     if isinstance(result, core.Choices):
+        core.remember_reply(
+            message.chat_id,
+            f"offered: {', '.join(o['place_name'] for o in result.options)}",
+        )
         await message.reply_text(
             f"{result.title} — which one?",
             reply_markup=InlineKeyboardMarkup([
@@ -146,6 +157,9 @@ async def _confirm_task(message, result: dict) -> None:
     card.append("\nShare Live Location and I'll remind you when you're close "
                 "with enough time to spare.")
 
+    core.remember_reply(
+        message.chat_id, f"confirmed: {result['title']} at {result['place_name']}"
+    )
     await message.reply_text(
         "\n".join(card),
         reply_markup=ReplyKeyboardMarkup(

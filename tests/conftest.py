@@ -26,7 +26,9 @@ def offline(monkeypatch):
 
     monkeypatch.setattr(
         services, "parse_task",
-        lambda text: {"title": "Pick up jacket", "place_query": "Central Cleaners Hong Kong"},
+        lambda text, context="": {"intent": "create", "title": "Pick up jacket",
+                                  "place_query": "Central Cleaners Hong Kong",
+                                  "kind": "place"},
     )
     monkeypatch.setattr(
         services, "resolve_place",
@@ -38,6 +40,7 @@ def offline(monkeypatch):
         },
     )
     monkeypatch.setattr(services, "enrich_hours", lambda name, address: "19:00")
+    monkeypatch.setattr(services, "reverse_place", lambda lat, lng: "Southern District, Hong Kong")
     monkeypatch.setattr(
         services, "calendar_status", lambda user: (42, "ics", "Team standup")
     )

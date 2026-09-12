@@ -16,6 +16,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 # Nominatim blocks requests without a descriptive User-Agent.
 USER_AGENT = "Detour/1.0 (hackathon errand bot)"
 

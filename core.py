@@ -27,6 +27,40 @@ class Choices:
     options: list[dict]
 
 
+@dataclass
+class Completed:
+    """The user said an existing errand is finished."""
+
+    task: dict
+
+
+AREA_REFRESH_M = 500  # don't re-geocode the neighbourhood for small movements
+
+
+def build_context(user: dict) -> str:
+    """What the parser gets to know: roughly where they are, what's outstanding,
+    and the last few turns."""
+    chat_id = user["chat_id"]
+    titles = [f"{t['title']} at {t['place_name']}" for t in db.open_tasks(chat_id)]
+    return services.build_context(
+        area=user.get("last_area"),
+        open_titles=titles,
+        recent=db.recent_messages(chat_id),
+    )
+
+
+def refresh_area(chat_id: int, lat: float, lng: float) -> None:
+    """Keep a human-readable neighbourhood name for the user's position."""
+    user = db.get_user(chat_id)
+    if user and user.get("area_lat") is not None:
+        moved = haversine(lat, lng, user["area_lat"], user["area_lng"])
+        if moved < AREA_REFRESH_M and user.get("last_area"):
+            return
+    area = services.reverse_place(lat, lng)
+    if area:
+        db.set_area(chat_id, area, lat, lng)
+
+
 def should_fire(task: dict, distance_m: float, mode: str, free_min: int) -> tuple[bool, dict]:
     if task["fired_at"] or task["done_at"]:
         return False, {}
@@ -71,6 +105,40 @@ def set_calendar(chat_id: int, value: str) -> str | None:
     return title
 
 
+def handle_message(chat_id: int, text: str) -> dict | Choices | Completed | Err:
+    """One parse, then route by intent. This is what the bot calls for free text."""
+    user = ensure_user(chat_id)
+    context = build_context(user)
+    db.add_message(chat_id, "user", text)
+
+    parsed = services.parse_task(text, context)
+    if not parsed:
+        return Err("I couldn't work out an errand from that. Try: "
+                   "\"pick up my jacket at Central Cleaners\".")
+
+    if parsed.get("intent") == "complete":
+        return _complete_by_reference(chat_id, parsed["task_ref"])
+
+    return _create_from_parsed(user, parsed)
+
+
+def remember_reply(chat_id: int, text: str) -> None:
+    """Record what we said, so the next turn can resolve "the other one"."""
+    db.add_message(chat_id, "bot", text)
+
+
+def _complete_by_reference(chat_id: int, task_ref: str) -> Completed | Err:
+    """Close the open errand the user referred to in words."""
+    needle = task_ref.lower()
+    for task in db.open_tasks(chat_id):
+        haystack = f"{task['title']} at {task['place_name']}".lower()
+        if needle in haystack or task["title"].lower() in needle:
+            db.mark_done(task["id"])
+            log.info("completed task %s by reference %r", task["id"], task_ref)
+            return Completed(task=db.get_task(task["id"]))
+    return Err(f"I couldn't match \"{task_ref}\" to an open errand. Try /tasks.")
+
+
 def create_task(chat_id: int, text: str) -> dict | Choices | Err:
     """parse_task -> find the place -> enrich_hours -> insert.
 
@@ -79,11 +147,15 @@ def create_task(chat_id: int, text: str) -> dict | Choices | Err:
     """
     user = ensure_user(chat_id)
 
-    parsed = services.parse_task(text)
-    if not parsed:
+    parsed = services.parse_task(text, build_context(user))
+    if not parsed or parsed.get("intent") == "complete":
         return Err("I couldn't work out an errand from that. Try: "
                    "\"pick up my jacket at Central Cleaners\".")
 
+    return _create_from_parsed(user, parsed)
+
+
+def _create_from_parsed(user: dict, parsed: dict) -> dict | Choices | Err:
     if parsed.get("kind") == "category":
         return _category_choices(user, parsed)
 
@@ -92,7 +164,7 @@ def create_task(chat_id: int, text: str) -> dict | Choices | Err:
         return Err(f"I couldn't find \"{parsed['place_query']}\". "
                    "Try naming the place more precisely.")
 
-    return _insert(chat_id, parsed["title"], place)
+    return _insert(user["chat_id"], parsed["title"], place)
 
 
 def _category_choices(user: dict, parsed: dict) -> Choices | Err:
@@ -154,6 +226,7 @@ def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
     """Check every open task against this position. Stamps fired_at as it goes."""
     user = ensure_user(chat_id)
     db.set_last_location(chat_id, lat, lng)  # so a later errand can search around here
+    refresh_area(chat_id, lat, lng)
     mode = user["travel_mode"]
     candidates = db.unfired_tasks(chat_id)
     if not candidates:

@@ -41,6 +41,16 @@ CREATE TABLE IF NOT EXISTS candidates (
     distance_m    INTEGER NOT NULL,
     created_at    TEXT    NOT NULL
 );
+
+-- Recent turns, so a follow-up like "no, the other one" has something to refer to.
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    role       TEXT    NOT NULL,   -- user | bot
+    text       TEXT    NOT NULL,
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 """
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS won't add
@@ -49,6 +59,9 @@ MIGRATIONS = [
     ("users", "last_lat", "REAL"),
     ("users", "last_lng", "REAL"),
     ("users", "last_seen_at", "TEXT"),
+    ("users", "last_area", "TEXT"),        # reverse-geocoded neighbourhood
+    ("users", "area_lat", "REAL"),         # where last_area was resolved, to avoid
+    ("users", "area_lng", "REAL"),         # re-geocoding every time they move a little
 ]
 
 
@@ -218,3 +231,29 @@ def get_candidate(candidate_id: int) -> dict | None:
 def clear_candidates(chat_id: int) -> None:
     with cursor() as conn:
         conn.execute("DELETE FROM candidates WHERE chat_id = ?", (chat_id,))
+
+
+def set_area(chat_id: int, area: str, lat: float, lng: float) -> None:
+    with cursor() as conn:
+        conn.execute(
+            "UPDATE users SET last_area = ?, area_lat = ?, area_lng = ? WHERE chat_id = ?",
+            (area, lat, lng, chat_id),
+        )
+
+
+def add_message(chat_id: int, role: str, text: str) -> None:
+    with cursor() as conn:
+        conn.execute(
+            "INSERT INTO messages (chat_id, role, text, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, role, text[:500], now_iso()),
+        )
+
+
+def recent_messages(chat_id: int, limit: int = 6) -> list[dict]:
+    """Last few turns, oldest first."""
+    with cursor() as conn:
+        rows = conn.execute(
+            "SELECT role, text FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            (chat_id, limit),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]

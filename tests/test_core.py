@@ -116,7 +116,7 @@ def test_create_task_stores_the_place(fresh_db, offline):
 
 
 def test_create_task_on_nonsense_returns_friendly_err(fresh_db, offline, monkeypatch):
-    monkeypatch.setattr(offline, "parse_task", lambda text: None)
+    monkeypatch.setattr(offline, "parse_task", lambda text, context="": None)
     result = core.create_task(CHAT, "asdfgh")
     assert isinstance(result, core.Err)
     assert "couldn't" in result.message
@@ -308,8 +308,9 @@ def test_users_do_not_see_each_others_tasks(fresh_db, offline):
 CYBERPORT = (22.26060, 114.13010)
 
 
-def category_parse(text):
-    return {"title": "Buy groceries", "place_query": "supermarket", "kind": "category"}
+def category_parse(text, context=""):
+    return {"intent": "create", "title": "Buy groceries",
+            "place_query": "supermarket", "kind": "category"}
 
 
 def fake_nearby(query, lat, lng, radius_m=2000, limit=3):
@@ -442,3 +443,124 @@ def test_candidates_survive_a_restart(fresh_db, offline, monkeypatch):
     task = reloaded.choose_candidate(CHAT, cid)
     assert not isinstance(task, core.Err)
     assert task["place_name"] == "PARKnSHOP"
+
+
+# --- conversation context -----------------------------------------------------
+
+def test_context_is_empty_for_a_brand_new_user(fresh_db, offline):
+    user = core.ensure_user(CHAT)
+    assert core.build_context(user) == ""
+
+
+def test_context_carries_area_open_tasks_and_recent_turns(fresh_db, offline):
+    core.ensure_user(CHAT)
+    core.on_location(CHAT, *CYBERPORT)          # learns the area
+    core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    db.add_message(CHAT, "user", "buy groceries")
+    db.add_message(CHAT, "bot", "which one?")
+
+    context = core.build_context(db.get_user(CHAT))
+    assert "NEAR: Southern District, Hong Kong" in context
+    assert "Pick up jacket at Central Cleaners" in context
+    assert "user: buy groceries" in context
+    assert "bot: which one?" in context
+
+
+def test_context_is_passed_to_the_parser(fresh_db, offline, monkeypatch):
+    seen = {}
+
+    def spy(text, context=""):
+        seen["context"] = context
+        return {"intent": "create", "title": "Pick up jacket", "kind": "place",
+                "place_query": "Central Cleaners Hong Kong"}
+
+    monkeypatch.setattr(offline, "parse_task", spy)
+    core.ensure_user(CHAT)
+    core.on_location(CHAT, *CYBERPORT)
+    core.handle_message(CHAT, "pick up the jacket")
+    assert "NEAR: Southern District, Hong Kong" in seen["context"]
+
+
+def test_area_is_not_regeocoded_for_small_movements(fresh_db, offline, monkeypatch):
+    calls = []
+    monkeypatch.setattr(offline, "reverse_place",
+                        lambda lat, lng: calls.append((lat, lng)) or "Southern District")
+    core.ensure_user(CHAT)
+    core.on_location(CHAT, *CYBERPORT)
+    core.on_location(CHAT, CYBERPORT[0] + 0.001, CYBERPORT[1])   # ~110m
+    assert len(calls) == 1  # Nominatim allows 1 req/sec; don't waste them
+
+
+def test_area_is_regeocoded_after_a_real_move(fresh_db, offline, monkeypatch):
+    calls = []
+    monkeypatch.setattr(offline, "reverse_place",
+                        lambda lat, lng: calls.append((lat, lng)) or "Somewhere")
+    core.ensure_user(CHAT)
+    core.on_location(CHAT, *CYBERPORT)
+    core.on_location(CHAT, 22.3193, 114.1702)   # Mong Kok
+    assert len(calls) == 2
+
+
+# --- completing an errand by talking -------------------------------------------
+
+def complete_parse(ref):
+    return lambda text, context="": {"intent": "complete", "task_ref": ref}
+
+
+def test_saying_done_closes_the_errand(fresh_db, offline, monkeypatch):
+    task = core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    monkeypatch.setattr(offline, "parse_task", complete_parse("Pick up jacket"))
+
+    result = core.handle_message(CHAT, "got the jacket")
+    assert isinstance(result, core.Completed)
+    assert result.task["id"] == task["id"]
+    assert result.task["done_at"] is not None
+    assert core.open_tasks(CHAT) == []
+
+
+def test_completion_matches_on_the_place_too(fresh_db, offline, monkeypatch):
+    core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    monkeypatch.setattr(offline, "parse_task", complete_parse("Central Cleaners"))
+    assert isinstance(core.handle_message(CHAT, "done at the cleaners"), core.Completed)
+
+
+def test_completion_with_no_match_is_a_friendly_error(fresh_db, offline, monkeypatch):
+    core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    monkeypatch.setattr(offline, "parse_task", complete_parse("buy a boat"))
+    result = core.handle_message(CHAT, "done with the boat")
+    assert isinstance(result, core.Err)
+    assert len(core.open_tasks(CHAT)) == 1  # nothing closed by mistake
+
+
+def test_completion_only_touches_your_own_errands(fresh_db, offline, monkeypatch):
+    core.create_task(CHAT, "pick up my jacket at Central Cleaners")
+    other = 555444
+    core.ensure_user(other)
+    monkeypatch.setattr(offline, "parse_task", complete_parse("Pick up jacket"))
+
+    assert isinstance(core.handle_message(other, "done"), core.Err)
+    assert len(core.open_tasks(CHAT)) == 1
+
+
+def test_handle_message_records_the_turn(fresh_db, offline):
+    core.ensure_user(CHAT)
+    core.handle_message(CHAT, "pick up my jacket at Central Cleaners")
+    core.remember_reply(CHAT, "confirmed: Pick up jacket")
+    recent = db.recent_messages(CHAT)
+    assert recent[0] == {"role": "user", "text": "pick up my jacket at Central Cleaners"}
+    assert recent[-1]["role"] == "bot"
+
+
+def test_history_is_capped(fresh_db, offline):
+    core.ensure_user(CHAT)
+    for i in range(20):
+        db.add_message(CHAT, "user", f"message {i}")
+    assert len(db.recent_messages(CHAT)) == 6
+    assert db.recent_messages(CHAT)[-1]["text"] == "message 19"  # newest last
+
+
+def test_handle_message_on_nonsense_still_friendly(fresh_db, offline, monkeypatch):
+    monkeypatch.setattr(offline, "parse_task", lambda text, context="": None)
+    result = core.handle_message(CHAT, "hello there")
+    assert isinstance(result, core.Err)
+    assert core.open_tasks(CHAT) == []
