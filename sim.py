@@ -82,9 +82,11 @@ def stub_parse_if_offline() -> None:
     if config.OPENROUTER_API_KEY:
         return
     print("! No OPENROUTER_API_KEY — stubbing parse_task so the flow still runs.\n")
-    services.parse_task = lambda text: {
+    services.parse_task = lambda text, context="": {
+        "intent": "create",
         "title": "Pick up jacket",
         "place_query": "Central Cleaners Hong Kong",
+        "kind": "place",
     }
 
 
@@ -149,9 +151,11 @@ def main() -> int:
     print(f"   open tasks = {len(core.open_tasks(CHAT_ID))}")
 
     print("\n8. nonsense input and an unfindable place")
-    services.parse_task = lambda text: None
+    services.parse_task = lambda text, context="": None
     print(f"   nonsense -> {core.create_task(CHAT_ID, 'asdfgh').message}")
-    services.parse_task = lambda text: {"title": "Buy thing", "place_query": "zzzqq nowhere 99999"}
+    services.parse_task = lambda text, context="": {
+        "intent": "create", "title": "Buy thing",
+        "place_query": "zzzqq nowhere 99999", "kind": "place"}
     print(f"   bad place -> {core.create_task(CHAT_ID, 'buy a thing at nowhere').message}")
 
     print("\nSIM PASSED")
