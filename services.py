@@ -39,6 +39,21 @@ Examples:
 -> {"title": "Buy detergent", "place_query": "Watsons Central Hong Kong"}
 """
 
+RETAILER_SYSTEM_PROMPT = """You read search results and list shops that sell a product.
+
+Return JSON only. No prose, no markdown fences.
+
+Schema:
+{"retailers": ["<shop or chain name>", ...]}
+
+Rules:
+- At most 3, most likely first.
+- Real shop or chain names only. Never a category like "pharmacy" or
+  "skincare store". Never a website, marketplace or delivery app.
+- Prefer chains with physical branches in the given city.
+- If the text names no real shop, return {"retailers": []}.
+"""
+
 
 # --- OpenRouter -------------------------------------------------------------
 
@@ -160,6 +175,79 @@ def _closing_time(text: str) -> str | None:
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return f"{hour:02d}:{minute:02d}"
     return None
+
+
+def discover_merchants(product: str, city: str = "Hong Kong") -> list[dict]:
+    """Product -> up to 3 real, geocoded shops that sell it. [] on any failure.
+
+    Exa finds pages about where to buy it, the LLM pulls shop names out of that
+    prose, and Nominatim turns each name into a pin. The user picks; nothing here
+    decides anything on their behalf.
+    """
+    names = _retailer_names(product, city)
+    if not names:
+        return []
+    found = []
+    seen = set()
+    for name in names:
+        place = resolve_place(f"{name} {city}")
+        if not place:
+            continue
+        key = (round(place["lat"], 4), round(place["lng"], 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(place)
+    log.info("discover_merchants(%r): %s -> %d geocoded", product, names, len(found))
+    return found[:3]
+
+
+def _retailer_names(product: str, city: str) -> list[str]:
+    if not EXA_API_KEY or not OPENROUTER_API_KEY:
+        return []
+    text = _search_text(f"where to buy {product} in {city} shops")
+    if not text:
+        return []
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY)
+        resp = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": RETAILER_SYSTEM_PROMPT},
+                {"role": "user",
+                 "content": f"Product: {product}
+City: {city}
+
+{text[:6000]}"},
+            ],
+        )
+        data = json.loads(resp.choices[0].message.content)
+        names = [str(n).strip() for n in data.get("retailers", []) if str(n).strip()]
+        return names[:3]
+    except Exception as e:
+        log.warning("_retailer_names failed for %r: %s", product, e)
+        return []
+
+
+def _search_text(query: str) -> str:
+    try:
+        from exa_py import Exa
+
+        results = Exa(EXA_API_KEY).search_and_contents(
+            query, num_results=3, text={"max_characters": 2500}
+        )
+        return "
+
+".join(
+            getattr(r, "text", "") or "" for r in getattr(results, "results", [])
+        )
+    except Exception as e:
+        log.warning("exa search failed for %r: %s", query, e)
+        return ""
 
 
 # --- Calendar: Ambiguous, then ICS ------------------------------------------
