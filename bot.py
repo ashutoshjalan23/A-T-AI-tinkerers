@@ -114,7 +114,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if isinstance(result, core.Choices):
         await message.reply_text(
-            reply.text or f"{result.title} — which one?",
+            reply.text or (
+                f"I searched online within 2 km of your latest shared location. "
+                f"{result.title} — which one?"
+            ),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
                     f"{o['place_name']} · {_pretty_distance(o['distance_m'])}",
@@ -128,7 +131,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(result, dict):
         if reply.text:
             await message.reply_text(reply.text)
-        await _confirm_task(message, result)
+        if reply.action_kind == "create":
+            await _confirm_task(message, result)
         return
 
     await message.reply_text(reply.text)
@@ -136,6 +140,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _pretty_distance(metres: int) -> str:
     return f"{metres}m" if metres < 1000 else f"{metres / 1000:.1f}km"
+
+
+def _format_hours(value: str, timezone: str) -> str:
+    """Present the business's local closing time, not a generic UTC time."""
+    return f"{value} {timezone}"
 
 
 async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,10 +162,14 @@ async def _confirm_task(message, result: dict) -> None:
     card = [f"Got it: {result['title']}", f"At {result['place_name']}"]
     if result["place_address"]:
         card.append(result["place_address"])
+    card.append(f"Location source: {result['place_source']}")
+    card.append(f"Map reference: {result['place_source_url']}")
     if result["hours"]:
-        card.append(f"Closes at {result['hours']}.")
-    card.append("\nShare Live Location and I'll remind you when you're close "
-                "with enough time to spare.")
+        card.append(f"Closes at {_format_hours(result['hours'], result['timezone'])}.")
+        card.append(f"Opening-hours source: {result['hours_source']}")
+    card.append("\nShare your current location and I'll remind you when you're close "
+                "with enough time to spare. To share movement, use Telegram's "
+                "attachment menu → Location → Share My Live Location.")
 
     core.remember_reply(
         message.chat_id, f"confirmed: {result['title']} at {result['place_name']}"
@@ -164,7 +177,7 @@ async def _confirm_task(message, result: dict) -> None:
     await message.reply_text(
         "\n".join(card),
         reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("Share Live Location", request_location=True)]],
+            [[KeyboardButton("Share Current Location", request_location=True)]],
             resize_keyboard=True,
             one_time_keyboard=True,
         ),
@@ -176,7 +189,13 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     location = message.location
     if not location:
         return
-    await _deliver(context, message.chat_id, location.latitude, location.longitude)
+    fired = await _deliver(context, message.chat_id, location.latitude, location.longitude)
+    # A request_location button sends one static message. A live location starts as
+    # a message and then becomes edits; acknowledge the initial save, not every edit.
+    if not fired and update.edited_message is None:
+        await message.reply_text(
+            "Location saved. I'll stay quiet until an errand is nearby and fits your calendar."
+        )
 
 
 async def sim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,7 +235,7 @@ def _reminder_text(fire: dict) -> str:
     else:
         lines.append("Nothing on your calendar to get in the way.")
     if task["hours"]:
-        lines.append(f"Closes at {task['hours']}.")
+        lines.append(f"Closes at {_format_hours(task['hours'], task['timezone'])}.")
     lines.append(f"\n{task['title']}?")
     return "\n".join(lines)
 

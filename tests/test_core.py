@@ -113,6 +113,9 @@ def test_create_task_stores_the_place(fresh_db, offline):
     assert task["place_name"] == "Central Cleaners"
     assert task["hours"] == "19:00"
     assert task["fired_at"] is None and task["done_at"] is None
+    assert task["place_source"] == "OpenStreetMap via Nominatim"
+    assert task["place_source_url"].startswith("https://www.openstreetmap.org/")
+    assert task["hours_source"] == "Exa web search"
 
 
 def test_create_task_on_nonsense_returns_friendly_err(fresh_db, offline, monkeypatch):

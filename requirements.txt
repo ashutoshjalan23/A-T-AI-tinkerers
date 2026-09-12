@@ -1,8 +1,9 @@
 python-telegram-bot==21.*
 openai
-openrouter-agent-sdk
+pydantic
 exa-py
 icalendar
 requests
 python-dotenv
+timezonefinder
 pytest

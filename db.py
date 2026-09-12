@@ -62,6 +62,9 @@ MIGRATIONS = [
     ("users", "last_area", "TEXT"),        # reverse-geocoded neighbourhood
     ("users", "area_lat", "REAL"),         # where last_area was resolved, to avoid
     ("users", "area_lng", "REAL"),         # re-geocoding every time they move a little
+    ("tasks", "scheduled_for", "TEXT"),
+    ("tasks", "reminder_lat", "REAL"),
+    ("tasks", "reminder_lng", "REAL"),
 ]
 
 
@@ -184,6 +187,15 @@ def mark_done(task_id: int) -> None:
         conn.execute(
             "UPDATE tasks SET done_at = ? WHERE id = ? AND done_at IS NULL",
             (now_iso(), task_id),
+        )
+
+
+def schedule_task(task_id: int, scheduled_for: str, lat: float | None, lng: float | None) -> None:
+    with cursor() as conn:
+        conn.execute(
+            """UPDATE tasks SET scheduled_for = ?, reminder_lat = ?, reminder_lng = ?
+               WHERE id = ? AND done_at IS NULL""",
+            (scheduled_for, lat, lng, task_id),
         )
 
 

@@ -54,6 +54,20 @@ def test_enrich_hours_without_a_key_returns_none(monkeypatch):
     assert services.enrich_hours("Central Cleaners", "Queen's Road") is None
 
 
+def test_timezone_label_uses_hong_kong_when_coordinate_lookup_is_unavailable(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def without_timezonefinder(name, *args, **kwargs):
+        if name == "timezonefinder":
+            raise ImportError("unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_timezonefinder)
+    assert services.timezone_label(22.2819, 114.1576) == "HKT"
+
+
 # --- Nominatim ---------------------------------------------------------------
 
 def test_demo_places_short_circuit_the_network(monkeypatch):

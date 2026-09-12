@@ -27,6 +27,22 @@ from geo import haversine
 log = logging.getLogger("detour.services")
 TZ = ZoneInfo(LOCAL_TZ)
 
+
+def timezone_label(lat: float, lng: float) -> str:
+    """Timezone abbreviation at coordinates, with Hong Kong as the safe fallback."""
+    try:
+        from timezonefinder import TimezoneFinder
+    except ImportError:
+        return datetime.now(TZ).tzname() or LOCAL_TZ
+
+    try:
+        name = TimezoneFinder().timezone_at(lat=lat, lng=lng)
+        if name:
+            return datetime.now(ZoneInfo(name)).tzname() or name
+    except Exception as exc:
+        log.warning("timezone lookup failed for %.5f, %.5f: %s", lat, lng, exc)
+    return datetime.now(TZ).tzname() or LOCAL_TZ
+
 PARSE_SYSTEM_PROMPT = """You read a message to an errand bot and say what the user wants.
 
 Return JSON only. No prose, no markdown fences, no explanation.
@@ -182,7 +198,7 @@ def resolve_place(query: str) -> dict | None:
     demo = _demo_place(query)
     if demo:
         log.info("resolve_place: DEMO_PLACES hit for %r", query)
-        return dict(demo)
+        return {**demo, "source": "Demo location fixture"}
     try:
         resp = requests.get(
             NOMINATIM_URL,
@@ -208,6 +224,7 @@ def resolve_place(query: str) -> dict | None:
             "address": display,
             "lat": float(hit["lat"]),
             "lng": float(hit["lon"]),
+            "source": "OpenStreetMap via Nominatim",
         }
     except Exception as e:
         log.warning("resolve_place failed for %r: %s", query, e)
@@ -259,6 +276,7 @@ def nearby_places(query: str, lat: float, lng: float, radius_m: int = NEARBY_RAD
             "lat": hit_lat,
             "lng": hit_lng,
             "distance_m": distance,
+            "source": "OpenStreetMap via Nominatim",
         })
     places.sort(key=lambda p: p["distance_m"])
     log.info("nearby_places(%r) within %dm: %d hits", query, radius_m, len(places))
@@ -438,6 +456,34 @@ def calendar_status(user: dict) -> tuple[int, str, str | None]:
             return minutes, source, event["title"]
     log.info("calendar: no source answered, assuming free")
     return NO_CALENDAR_MINUTES, "none", None
+
+
+def calendar_snapshot(user: dict) -> dict:
+    """Structured calendar facts, including an active ICS event when available."""
+    minutes, source, next_title = calendar_status(user)
+    snapshot = {"source": source, "minutes_until_next": minutes,
+                "next_event": next_title, "current_event": None}
+    if source != "ics" or not user.get("ics_url"):
+        return snapshot
+    try:
+        from icalendar import Calendar
+        resp = requests.get(user["ics_url"], headers={"User-Agent": USER_AGENT}, timeout=10)
+        resp.raise_for_status()
+        now = datetime.now(TZ)
+        for comp in Calendar.from_ical(resp.content).walk("VEVENT"):
+            start = comp.decoded("DTSTART")
+            end = comp.decoded("DTEND") if comp.get("DTEND") else None
+            if not isinstance(start, datetime) or not isinstance(end, datetime):
+                continue
+            start = start.replace(tzinfo=TZ) if start.tzinfo is None else start
+            end = end.replace(tzinfo=TZ) if end.tzinfo is None else end
+            if start <= now < end:
+                snapshot["current_event"] = {"title": str(comp.get("SUMMARY", "current event")),
+                                             "starts_at": start.isoformat(), "ends_at": end.isoformat()}
+                break
+    except Exception as exc:
+        log.warning("calendar snapshot failed: %s", exc)
+    return snapshot
 
 
 def _minutes_until(start: datetime) -> int:

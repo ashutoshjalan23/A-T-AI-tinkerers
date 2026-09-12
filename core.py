@@ -1,6 +1,8 @@
 """Orchestration. Every decision lives here and runs without Telegram."""
 import logging
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import db
 import services
@@ -132,7 +134,7 @@ async def handle_conversation(chat_id: int, text: str):
 
     user = ensure_user(chat_id)
     db.add_message(chat_id, "user", text)
-    agent = OrchestrationAgent(_create_from_parsed, _complete_by_reference, build_context)
+    agent = OrchestrationAgent(_create_from_parsed, _complete_by_reference, schedule_task, build_context)
     reply = await agent.respond(user, text)
     if reply.text:
         db.add_message(chat_id, "bot", reply.text)
@@ -241,6 +243,19 @@ def _insert(chat_id: int, title: str, place: dict) -> dict:
     )
     log.info("created task %s for chat %s: %r @ %r", task["id"], chat_id, task["title"],
              task["place_name"])
+    return _with_place_metadata(task, place.get("source"))
+
+
+def _with_place_metadata(task: dict, place_source: str | None = None) -> dict:
+    """Attach honest, user-visible provenance for a resolved place."""
+    task["timezone"] = services.timezone_label(task["lat"], task["lng"])
+    task["place_source"] = place_source or "OpenStreetMap via Nominatim"
+    task["place_source_url"] = (
+        "https://www.openstreetmap.org/?mlat="
+        f"{task['lat']}&mlon={task['lng']}#map=18/{task['lat']}/{task['lng']}"
+    )
+    if task["hours"]:
+        task["hours_source"] = "Exa web search"
     return task
 
 
@@ -262,6 +277,14 @@ def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
 
     fires = []
     for task in candidates:
+        if task.get("scheduled_for"):
+            try:
+                due = datetime.fromisoformat(task["scheduled_for"])
+                due = due.replace(tzinfo=ZoneInfo("Asia/Hong_Kong")) if due.tzinfo is None else due
+                if datetime.now(due.tzinfo) < due:
+                    continue
+            except ValueError:
+                log.warning("task %s has invalid scheduled_for", task["id"])
         distance = MapAgent().distance_to(lat, lng, task)
         fire, metrics = should_fire(task, distance, mode, free_min)
         log.info(
@@ -273,8 +296,9 @@ def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
             continue
         # Stamped in the same call, so repeated live-location updates can't double-fire.
         db.mark_fired(task["id"])
+        fired_task = _with_place_metadata(db.get_task(task["id"]))
         fires.append({
-            "task": db.get_task(task["id"]),
+            "task": fired_task,
             "mode": mode,
             "event_title": event_title,
             "calendar_source": source,
@@ -285,6 +309,22 @@ def on_location(chat_id: int, lat: float, lng: float) -> list[dict]:
 
 def complete_task(task_id: int) -> None:
     db.mark_done(task_id)
+
+
+def schedule_task(chat_id: int, task_ref: str, scheduled_for: str) -> dict | Err:
+    """Persist a user-requested schedule after validating the LLM-supplied ISO time."""
+    try:
+        when = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+    except ValueError:
+        return Err("I need a specific time before I can schedule that errand.")
+    when = when.replace(tzinfo=ZoneInfo("Asia/Hong_Kong")) if when.tzinfo is None else when
+    needle = task_ref.lower()
+    for task in db.open_tasks(chat_id):
+        if needle in f"{task['title']} {task['place_name']}".lower():
+            user = ensure_user(chat_id)
+            db.schedule_task(task["id"], when.isoformat(), user.get("last_lat"), user.get("last_lng"))
+            return db.get_task(task["id"])
+    return Err("I couldn't match that to an open errand. Try /tasks.")
 
 
 def open_tasks(chat_id: int) -> list[dict]:

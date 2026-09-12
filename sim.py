@@ -77,17 +77,20 @@ def fixture_ics(minutes_ahead: int = 42) -> str:
     return f"http://127.0.0.1:{server.server_address[1]}/demo.ics"
 
 
-def stub_parse_if_offline() -> None:
-    """No OpenRouter key? Stub the parser so the rest of the flow still runs."""
-    if config.OPENROUTER_API_KEY:
-        return
-    print("! No OPENROUTER_API_KEY — stubbing parse_task so the flow still runs.\n")
+def stub_services_for_sim() -> None:
+    """The simulator is intentionally offline, even when real API keys are set."""
+    print("! Sim uses local service fixtures; no external AI or search calls are made.\n")
     services.parse_task = lambda text, context="": {
         "intent": "create",
         "title": "Pick up jacket",
         "place_query": "Central Cleaners Hong Kong",
         "kind": "place",
     }
+    services.enrich_hours = lambda name, address: None
+    services.reverse_place = lambda lat, lng: None
+    services.resolve_place = lambda query: (
+        dict(services._demo_place(query)) if services._demo_place(query) else None
+    )
 
 
 def show(fires: list[dict]) -> None:
@@ -107,7 +110,7 @@ def main() -> int:
     if os.path.exists(config.DB_PATH):
         os.remove(config.DB_PATH)
     db.init_db()
-    stub_parse_if_offline()
+    stub_services_for_sim()
 
     print("1. ensure_user + travel mode")
     core.ensure_user(CHAT_ID)

@@ -20,9 +20,9 @@ workers:
 - **Live-location agent** — deterministic persistence of each Telegram live
   location update.
 
-The scheduler and orchestrator are limited to the Agent SDK's tool loop. The
-map and live-location workers never call a model. Crucially, neither LLM can
-fire a reminder: the existing deterministic distance-and-round-trip rule in
+The scheduler and orchestrator run a bounded OpenRouter-compatible tool loop.
+The map and live-location workers never call a model. Crucially, neither LLM
+can fire a reminder: the existing deterministic distance-and-round-trip rule in
 `core.on_location` remains the only notification gate.
 
 ## Setup
